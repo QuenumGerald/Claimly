@@ -1,0 +1,38 @@
+services:
+  - type: web
+    name: gateway
+    env: node
+    rootDir: gateway
+    plan: free
+    region: oregon
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: DATABASE_URL
+        fromDatabase: opensaas-db
+        property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: CORS_ORIGINS
+        value: https://your-frontend.example.com
+
+  - type: static_site
+    name: blog
+    rootDir: blog
+    plan: free
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+
+  - type: pserv
+    name: opensaas-db
+    plan: free
+    runtime: postgres
+    postgresMajorVersion: 15
+    region: oregon
+
+databases:
+  - name: opensaas-db
+    plan: free
+    region: oregon

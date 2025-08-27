@@ -1,0 +1,186 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id                        String          @id @default(uuid())
+  createdAt                 DateTime        @default(now())
+
+  email                     String?         @unique
+  username                  String?         @unique
+  isAdmin                   Boolean         @default(false)
+
+  paymentProcessorUserId    String?         @unique
+  lemonSqueezyCustomerPortalUrl String?     // You can delete this if you're not using Lemon Squeezy as your payments processor.
+  subscriptionStatus        String?         // 'active', 'cancel_at_period_end', 'past_due', 'deleted'
+  subscriptionPlan          String?         // 'hobby', 'pro'
+  datePaid                  DateTime?
+  credits                   Int             @default(3)
+
+  gptResponses              GptResponse[]
+  contactFormMessages       ContactFormMessage[]
+  tasks                     Task[]
+  files                     File[]
+}
+
+model GptResponse {
+  id                        String          @id @default(uuid())
+  createdAt                 DateTime        @default(now())
+  updatedAt                 DateTime        @updatedAt
+
+  user                      User            @relation(fields: [userId], references: [id])
+  userId                    String
+
+  content                   String
+}
+
+model Task {
+  id                        String          @id @default(uuid())
+  createdAt                 DateTime        @default(now())
+
+  user                      User            @relation(fields: [userId], references: [id])
+  userId                    String
+
+  description               String
+  time                      String          @default("1")
+  isDone                    Boolean         @default(false)
+}
+
+model File {
+  id                        String          @id @default(uuid())
+  createdAt                 DateTime        @default(now())
+
+  user                      User            @relation(fields: [userId], references: [id])
+  userId                    String
+
+  // Optional organization the file is associated with (for multi-tenant data segregation)
+  organization              Organization?   @relation(fields: [organizationId], references: [id])
+  organizationId            String?
+
+  name                      String
+  type                      String
+  key                       String
+  uploadUrl                 String
+}
+
+/// Organization represents a tenant. Users can belong to multiple organizations via OrganizationMember.
+model Organization {
+  id              String                 @id @default(uuid())
+  createdAt       DateTime               @default(now())
+  name            String
+  slug            String                 @unique
+
+  // Relations
+  members         OrganizationMember[]
+  files           File[]
+  credits         Credit[]
+  filings         Filing[]
+}
+
+/// Join table between User and Organization with role.
+model OrganizationMember {
+  id              String         @id @default(uuid())
+  createdAt       DateTime       @default(now())
+
+  user            User           @relation(fields: [userId], references: [id])
+  userId          String
+
+  organization    Organization   @relation(fields: [organizationId], references: [id])
+  organizationId  String
+
+  role            String         @default("member") // e.g., owner | admin | member
+
+  @@unique([userId, organizationId])
+  @@index([organizationId])
+  @@index([userId])
+}
+
+/// Credit ledger per organization (or user fallback) to support usage-based quotas.
+model Credit {
+  id              String         @id @default(uuid())
+  createdAt       DateTime       @default(now())
+
+  organization    Organization?  @relation(fields: [organizationId], references: [id])
+  organizationId  String?
+
+  user            User?          @relation(fields: [userId], references: [id])
+  userId          String?
+
+  amount          Int            // positive to add, negative to consume
+  reason          String?
+
+  @@index([organizationId])
+  @@index([userId])
+}
+
+/// Filing represents a business process document or submission within a tenant.
+model Filing {
+  id              String         @id @default(uuid())
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  organization    Organization   @relation(fields: [organizationId], references: [id])
+  organizationId  String
+
+  createdBy       User           @relation(fields: [createdById], references: [id])
+  createdById     String
+
+  status          String         @default("draft") // draft | submitted | processing | completed | failed
+  reference       String         @unique
+  metadata        Json?
+
+  @@index([organizationId])
+  @@index([createdById])
+}
+
+model DailyStats {
+  id                               Int             @id @default(autoincrement())
+  date                             DateTime        @default(now()) @unique
+
+  totalViews                       Int             @default(0)
+  prevDayViewsChangePercent        String          @default("0")
+  userCount                        Int             @default(0)
+  paidUserCount                    Int             @default(0)
+  userDelta                        Int             @default(0)
+  paidUserDelta                    Int             @default(0)
+  totalRevenue                     Float           @default(0)
+  totalProfit                      Float           @default(0)
+
+  sources                          PageViewSource[]
+}
+
+model PageViewSource {
+  @@id([date, name])
+  name                     String
+  date                     DateTime        @default(now())
+
+  dailyStats               DailyStats?     @relation(fields: [dailyStatsId], references: [id])
+  dailyStatsId             Int?
+
+  visitors                 Int
+}
+
+model Logs {
+  id                       Int             @id @default(autoincrement())
+  createdAt                DateTime        @default(now())
+
+  message                  String
+  level                    String
+}
+
+model ContactFormMessage {
+  id                        String          @id @default(uuid())
+  createdAt                 DateTime        @default(now())
+
+  user                      User            @relation(fields: [userId], references: [id])
+  userId                    String
+
+  content                   String
+  isRead                    Boolean         @default(false)
+  repliedAt                 DateTime?
+}
