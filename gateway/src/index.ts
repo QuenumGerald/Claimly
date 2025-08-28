@@ -7,6 +7,9 @@ import { Client as MinioClient } from 'minio'
 import { PrismaClient } from '@prisma/client'
 import { z } from 'zod'
 import crypto from 'crypto'
+import { QdrantClient } from 'qdrant-client'
+import { pipeline } from '@xenova/transformers'
+import { mapCreditsToForms, generateSummaryPdf, uploadToMinio, createFilingEntry, CreditInput } from './services/filingService.js'
 
 const PORT = Number(process.env.PORT ?? 8080)
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret'
@@ -18,6 +21,12 @@ const MINIO_ACCESS_KEY = process.env.MINIO_ACCESS_KEY
 const MINIO_SECRET_KEY = process.env.MINIO_SECRET_KEY
 const MINIO_BUCKET = process.env.MINIO_BUCKET || 'uploads'
 const APP_SHARED_SECRET = process.env.APP_SHARED_SECRET || ''
+const QDRANT_URL = process.env.QDRANT_URL || 'http://localhost:6333'
+const QDRANT_API_KEY = process.env.QDRANT_API_KEY
+const QDRANT_COLLECTION = process.env.QDRANT_COLLECTION || 'tax_programs'
+const QDRANT_VECTOR_SIZE = Number(process.env.QDRANT_VECTOR_SIZE || 384)
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || ''
+const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat'
 
 const prisma = new PrismaClient({
   datasources: {
@@ -40,6 +49,22 @@ async function buildServer() {
   // JWT (placeholder - integrate with OpenSaaS auth in next step)
   await app.register(fastifyJwt, { secret: JWT_SECRET })
   await app.register(multipart)
+
+  // MinIO client
+  const minio = new MinioClient({
+    endPoint: MINIO_ENDPOINT as string,
+    port: MINIO_PORT,
+    useSSL: MINIO_USE_SSL,
+    accessKey: MINIO_ACCESS_KEY as string,
+    secretKey: MINIO_SECRET_KEY as string,
+  })
+  // Ensure bucket exists
+  try {
+    const exists = await minio.bucketExists(MINIO_BUCKET)
+    if (!exists) await minio.makeBucket(MINIO_BUCKET, '')
+  } catch (e) {
+    app.log.warn({ err: e }, 'MinIO bucket check failed (continuing)')
+  }
 
   app.decorate('authenticate', async (request: any, reply: any) => {
     try {
@@ -69,6 +94,52 @@ async function buildServer() {
       }
       const token = (app as any).jwt.sign({ sub: body.userId, email: body.email, orgId: body.orgId })
       return { token }
+    }
+  )
+
+  // Generate Filing PDF from credits and profile, upload to MinIO, create filing record
+  app.post<{ Params: { orgId: string }; Body: { profile: Record<string, any>; credits: CreditInput[] } }>(
+    '/api/:orgId/filings/generate',
+    { preValidation: [app.authenticate] as any },
+    async (req, reply) => {
+      const { orgId } = req.params
+      const schema = z.object({
+        profile: z.record(z.any()),
+        credits: z.array(z.object({
+          credit_id: z.string(),
+          name: z.string(),
+          amount_estimated: z.number(),
+          explanation: z.string(),
+        })),
+      })
+      const body = schema.parse(req.body)
+      const userId = resolveUserId(req as any)
+      if (!(await verifyOrgAccess(orgId, userId))) return reply.code(403).send({ error: 'Forbidden' })
+
+      // Map credits -> forms
+      const { forms, mapping } = await mapCreditsToForms(body.credits)
+
+      // Generate PDF
+      const pdfBytes = await generateSummaryPdf({ profile: body.profile, credits: body.credits, forms, mapping })
+
+      // Upload
+      const { key, url } = await uploadToMinio(minio, MINIO_BUCKET, pdfBytes)
+
+      // Create filing entry (graceful if model missing)
+      let filing: any = null
+      try {
+        filing = await createFilingEntry(prisma as any, {
+          organizationId: orgId,
+          createdById: userId as string,
+          metadata: { forms, mapping },
+          fileKey: key,
+          fileUrl: url,
+        })
+      } catch (e) {
+        req.log.warn({ err: e }, 'Failed to create filing entry, returning file info only')
+      }
+
+      return { orgId, forms, mapping, file: { key, url }, filing }
     }
   )
   app.post<{ Body: { email: string; orgId?: string } }>(
@@ -195,6 +266,145 @@ async function buildServer() {
       if (!(await verifyOrgAccess(orgId, userId))) return { error: 'Forbidden' }
       const files = await prisma.file.findMany({ where: { organizationId: orgId } })
       return files
+    }
+  )
+
+  // Upload file -> MinIO and record in DB
+  app.post(
+    '/api/files/upload',
+    { preValidation: [app.authenticate] as any },
+    async (req: any, reply) => {
+      const part = await req.file()
+      if (!part) return reply.code(400).send({ error: 'No file' })
+
+      const orgId = (req.body?.orgId as string) || resolveOrgId(req)
+      const userId = resolveUserId(req)
+      if (!orgId) return reply.code(400).send({ error: 'Missing orgId' })
+      if (!(await verifyOrgAccess(orgId, userId))) return reply.code(403).send({ error: 'Forbidden' })
+
+      const filename = part.filename || 'upload.bin'
+      const contentType = part.mimetype || 'application/octet-stream'
+
+      // Stream to buffer to get size (MinIO putObject requires size for streams)
+      const chunks: Buffer[] = []
+      for await (const chunk of part.file) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+      const buf = Buffer.concat(chunks)
+
+      const key = `uploads/${orgId}/${Date.now()}-${filename}`
+      await minio.putObject(MINIO_BUCKET, key, buf, buf.length, { 'Content-Type': contentType })
+      const url = await minio.presignedGetObject(MINIO_BUCKET, key)
+
+      let record: any = null
+      try {
+        record = await prisma.file.create({
+          data: {
+            userId: userId as string,
+            organizationId: orgId,
+            name: filename,
+            type: contentType,
+            key,
+            uploadUrl: url,
+          },
+        })
+      } catch (e) {
+        req.log.warn({ err: e }, 'Failed to persist File, returning object info only')
+      }
+
+      return { id: record?.id, key, url, name: filename, type: contentType }
+    }
+  )
+
+  // --------- RAG: Query credits via DeepSeek + Qdrant ---------
+  type RagResponseItem = { credit_id: string; name: string; amount_estimated: number; explanation: string }
+  const qdrant = new QdrantClient({ url: QDRANT_URL, apiKey: QDRANT_API_KEY })
+  let embedder: any
+  async function getEmbedder() {
+    if (!embedder) embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2')
+    return embedder
+  }
+  function l2Normalize(vec: number[]): number[] {
+    const norm = Math.sqrt(vec.reduce((s, x) => s + x * x, 0)) || 1
+    return vec.map((x) => x / norm)
+  }
+  function meanPool(vectors: number[][]): number[] {
+    const length = vectors[0].length
+    const sum = new Array(length).fill(0)
+    for (const v of vectors) for (let i = 0; i < length; i++) sum[i] += v[i]
+    return sum.map((x) => x / vectors.length)
+  }
+
+  app.post<{ Body: { orgId?: string; profile: Record<string, any>; topK?: number } }>(
+    '/api/rag/credits',
+    { preValidation: [app.authenticate] as any },
+    async (req, reply) => {
+      if (!DEEPSEEK_API_KEY) return reply.code(500).send({ error: 'DeepSeek not configured' })
+      const schema = z.object({ orgId: z.string().optional(), profile: z.record(z.any()), topK: z.number().int().min(1).max(50).optional() })
+      const body = schema.parse(req.body)
+      const orgId = body.orgId || resolveOrgId(req)
+      const userId = resolveUserId(req as any)
+      if (orgId && !(await verifyOrgAccess(orgId, userId))) return reply.code(403).send({ error: 'Forbidden' })
+
+      // 1) Embed query (company profile rendered to text)
+      const profileText = JSON.stringify(body.profile)
+      const embed = await getEmbedder()
+      const result: any = await embed(profileText, { pooling: 'none', normalize: false })
+      const vectors = Array.from(result.data as any) as unknown as number[][]
+      const queryVec = l2Normalize(meanPool(vectors))
+
+      // 2) Qdrant search
+      const topK = body.topK ?? 8
+      const search = await qdrant.search(QDRANT_COLLECTION, {
+        vector: queryVec,
+        limit: topK,
+        with_payload: true,
+      } as any)
+      const contextItems = (search as any[]).map((p: any) => p.payload)
+      const contextText = contextItems
+        .map((p: any, i: number) => `#${i + 1} ${p.title}\nSource: ${p.source}\nURL: ${p.url}`)
+        .join('\n\n')
+
+      // 3) DeepSeek prompt
+      const system = `Tu es un assistant fiscal. Réponds en JSON strict, tableau d'objets {credit_id, name, amount_estimated, explanation}. N'inclus AUCUN texte hors JSON.`
+      const userPrompt = `Voici profil entreprise:\n${profileText}\n\nLois / context:\n${contextText}\n\nQuestion: Quels crédits sont applicables ? Donne montant estimé (nombre) + raison. Réponds uniquement en JSON.`
+      const dsRes = await fetch('https://api.deepseek.com/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: DEEPSEEK_MODEL,
+          messages: [
+            { role: 'system', content: system },
+            { role: 'user', content: userPrompt },
+          ],
+          temperature: 0.2,
+        }),
+      })
+      if (!dsRes.ok) return reply.code(502).send({ error: 'DeepSeek error', status: dsRes.status })
+      const dsJson: any = await dsRes.json()
+      const content: string | undefined = dsJson?.choices?.[0]?.message?.content
+      if (!content) return reply.code(502).send({ error: 'Invalid DeepSeek response' })
+
+      // 4) Parse JSON strictly
+      let parsed: RagResponseItem[] = []
+      try {
+        parsed = JSON.parse(content)
+      } catch {
+        // Try to extract JSON block if model leaked text
+        const match = content.match(/\[.*\]/s)
+        if (match) parsed = JSON.parse(match[0])
+      }
+      if (!Array.isArray(parsed)) return reply.code(502).send({ error: 'Model did not return JSON array' })
+
+      // 5) Sanitize
+      const clean = parsed.map((x) => ({
+        credit_id: String((x as any).credit_id || ''),
+        name: String((x as any).name || ''),
+        amount_estimated: Number((x as any).amount_estimated || 0),
+        explanation: String((x as any).explanation || ''),
+      }))
+      return clean
     }
   )
 
