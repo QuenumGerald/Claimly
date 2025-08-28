@@ -26,6 +26,10 @@ model User {
   contactFormMessages       ContactFormMessage[]
   tasks                     Task[]
   files                     File[]
+  // Back-relations for multi-tenant entities
+  organizationMemberships   OrganizationMember[]
+  creditEntries             Credit[]        @relation("UserCreditEntries")
+  filingsCreated            Filing[]        @relation("UserFilingsCreated")
 }
 
 model GptResponse {
@@ -108,7 +112,7 @@ model Credit {
   organization    Organization?  @relation(fields: [organizationId], references: [id])
   organizationId  String?
 
-  user            User?          @relation(fields: [userId], references: [id])
+  user            User?          @relation(name: "UserCreditEntries", fields: [userId], references: [id])
   userId          String?
 
   amount          Int            // positive to add, negative to consume
@@ -127,7 +131,7 @@ model Filing {
   organization    Organization   @relation(fields: [organizationId], references: [id])
   organizationId  String
 
-  createdBy       User           @relation(fields: [createdById], references: [id])
+  createdBy       User           @relation(name: "UserFilingsCreated", fields: [createdById], references: [id])
   createdById     String
 
   status          String         @default("draft") // draft | submitted | processing | completed | failed
