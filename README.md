@@ -6,3 +6,13 @@ This project is based on [OpenSaas](https://opensaas.sh) template and consists o
 3. `blog` - Your blog / docs, built with [Astro](https://docs.astro.build) based on [Starlight](https://starlight.astro.build/) template.
 
 For more details, check READMEs of each respective directory!
+
+## Running locally
+
+Start the application, gateway and dashboard with a single command:
+
+```bash
+npm run dev
+```
+
+This script expects the required `.env` files and a local [Wasp](https://wasp.sh) installation.

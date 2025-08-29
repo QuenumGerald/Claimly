@@ -1,5 +1,6 @@
 {
   "scripts": {
+    "dev": "./start-local.sh",
     "test": "node --loader ts-node/esm --test tests/*.test.ts"
   },
   "devDependencies": {
