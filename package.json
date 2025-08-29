@@ -1,6 +1,11 @@
 {
+  "scripts": {
+    "test": "node --loader ts-node/esm --test tests/*.test.ts"
+  },
   "devDependencies": {
-    "prisma": "^5.19.1"
+    "prisma": "^5.19.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.3"
   },
   "dependencies": {
     "@prisma/client": "^5.19.1"

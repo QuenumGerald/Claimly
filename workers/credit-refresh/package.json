@@ -1,0 +1,9 @@
+{
+  "name": "credit-refresh-worker",
+  "type": "module",
+  "dependencies": {
+    "@prisma/client": "^5.19.1",
+    "node-fetch": "^3.3.0",
+    "@sendgrid/mail": "^7.7.0"
+  }
+}

@@ -25,6 +25,24 @@ services:
     buildCommand: npm ci && npm run build
     staticPublishPath: dist
 
+  - type: cron
+    name: credit-refresher
+    env: node
+    rootDir: workers/credit-refresh
+    plan: free
+    region: oregon
+    schedule: '0 0 * * 0'
+    buildCommand: npm ci
+    startCommand: node index.js
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: DATABASE_URL
+        fromDatabase: opensaas-db
+        property: connectionString
+      - key: SENDGRID_API_KEY
+        sync: false
+
   - type: pserv
     name: opensaas-db
     plan: free

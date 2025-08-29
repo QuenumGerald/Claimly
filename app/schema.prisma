@@ -1,0 +1,46 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Organization {
+  id                   String   @id @default(uuid())
+  lemon_customer_id    String?  @unique
+  lemon_subscription_id String? @unique
+  plan                 String
+  status               String
+  current_period_end   DateTime?
+  entitlements         Entitlement[]
+  usageCounters        UsageCounter[]
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+}
+
+model WebhookEvent {
+  id         String   @id
+  type       String
+  payload    Json
+  created_at DateTime @default(now())
+}
+
+model Entitlement {
+  id     String      @id @default(uuid())
+  org    Organization @relation(fields: [org_id], references: [id])
+  org_id String
+  key    String
+  value  String
+}
+
+model UsageCounter {
+  id           String      @id @default(uuid())
+  org          Organization @relation(fields: [org_id], references: [id])
+  org_id       String
+  key          String
+  period_start DateTime
+  period_end   DateTime
+  value        Int      @default(0)
+}
