@@ -573,7 +573,13 @@ export async function buildServer(prisma = new PrismaClient({
   return app
 }
 
-if (require.main === module) {
+import { fileURLToPath } from 'url'
+import { dirname } from 'path'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = dirname(__filename)
+
+if (import.meta.url === `file://${process.argv[1]}`) {
   buildServer()
     .then((app) => app.listen({ port: PORT, host: '0.0.0.0' }))
     .then((address) => {
