@@ -92,3 +92,34 @@ test('webhook subscription_cancelled updates status', async () => {
   assert.equal(res.statusCode, 200)
   assert.equal(orgs['org1'].status, 'cancelled')
 })
+
+test('LEMON_API_KEY is masked in request logs', async () => {
+  const { prisma } = makeApp()
+  const app = await buildServer(prisma as any)
+
+  // Capture log output
+  let logOutput = ''
+  const originalLog = console.log
+  console.log = (...args) => {
+    logOutput += args.join(' ')
+  }
+
+  // Make request with LEMON_API_KEY in body
+  const body = {
+    LEMON_API_KEY: 'secret-key-here',
+    otherField: 'normal-data'
+  }
+
+  const res = await app.inject({
+    method: 'POST',
+    url: '/api/billing/webhook',
+    payload: body,
+    headers: { 'x-signature': 'invalid-sig' } // Will fail but still log
+  })
+
+  console.log = originalLog // Restore original console.log
+
+  // Verify LEMON_API_KEY is not in the logs
+  assert(!logOutput.includes('secret-key-here'), 'LEMON_API_KEY should be masked in logs')
+  assert(logOutput.includes('[REDACTED - Contains API Key]'), 'Should show redaction message')
+})

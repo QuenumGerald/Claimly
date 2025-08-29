@@ -32,7 +32,38 @@ export async function buildServer(prisma = new PrismaClient({
     db: { url: process.env.DATABASE_URL },
   },
 })) {
-  const app = Fastify({ logger: { level: 'info', redact: ['req.headers.authorization', 'LEMON_API_KEY'] } })
+  const app = Fastify({
+    logger: {
+      level: 'info',
+      redact: ['req.headers.authorization'],
+      serializers: {
+        req: (req) => {
+          const serialized: any = {
+            method: req.method,
+            url: req.url,
+            headers: { ...req.headers },
+            hostname: req.hostname,
+            remoteAddress: req.ip,
+            remotePort: req.socket?.remotePort
+          }
+          // Mask LEMON_API_KEY in request body if present
+          if (req.body && typeof req.body === 'object') {
+            const bodyStr = JSON.stringify(req.body)
+            if (bodyStr.includes('LEMON_API_KEY')) {
+              serialized.body = '[REDACTED - Contains API Key]'
+            } else {
+              serialized.body = req.body
+            }
+          }
+          return serialized
+        },
+        res: (res) => ({
+          statusCode: res.statusCode,
+          headers: res.headers
+        })
+      }
+    }
+  })
 
   // Security & CORS
   await app.register(fastifyCors, {
