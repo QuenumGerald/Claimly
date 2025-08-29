@@ -7,9 +7,8 @@ import { Client as MinioClient } from 'minio'
 import { PrismaClient } from '@prisma/client'
 import { z } from 'zod'
 import crypto from 'crypto'
-import { QdrantClient } from 'qdrant-client'
-import { pipeline } from '@xenova/transformers'
 import { mapCreditsToForms, generateSummaryPdf, uploadToMinio, createFilingEntry, CreditInput } from './services/filingService.js'
+import { createCheckout, getVariants, createCustomerPortal, verifyWebhookSignature } from './services/lemon'
 
 const PORT = Number(process.env.PORT ?? 8080)
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret'
@@ -28,14 +27,43 @@ const QDRANT_VECTOR_SIZE = Number(process.env.QDRANT_VECTOR_SIZE || 384)
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || ''
 const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat'
 
-const prisma = new PrismaClient({
+export async function buildServer(prisma = new PrismaClient({
   datasources: {
     db: { url: process.env.DATABASE_URL },
   },
-})
-
-async function buildServer() {
-  const app = Fastify({ logger: true })
+})) {
+  const app = Fastify({
+    logger: {
+      level: 'info',
+      redact: ['req.headers.authorization'],
+      serializers: {
+        req: (req) => {
+          const serialized: any = {
+            method: req.method,
+            url: req.url,
+            headers: { ...req.headers },
+            hostname: req.hostname,
+            remoteAddress: req.ip,
+            remotePort: req.socket?.remotePort
+          }
+          // Mask LEMON_API_KEY in request body if present
+          if (req.body && typeof req.body === 'object') {
+            const bodyStr = JSON.stringify(req.body)
+            if (bodyStr.includes('LEMON_API_KEY')) {
+              serialized.body = '[REDACTED - Contains API Key]'
+            } else {
+              serialized.body = req.body
+            }
+          }
+          return serialized
+        },
+        res: (res) => ({
+          statusCode: res.statusCode,
+          headers: res.headers
+        })
+      }
+    }
+  })
 
   // Security & CORS
   await app.register(fastifyCors, {
@@ -187,6 +215,46 @@ async function buildServer() {
     return !!member
   }
 
+  function requireSubscription(plan?: string) {
+    return async (req: any, reply: any) => {
+      const orgId = resolveOrgId(req)
+      if (!orgId) return reply.code(403).send({ error: 'No organization' })
+      const org = await prisma.organization.findUnique({ where: { id: orgId } })
+      if (!org) return reply.code(403).send({ error: 'Org not found' })
+      if (!['active', 'trialing'].includes(org.status))
+        return reply.code(402).send({ error: 'Subscription inactive' })
+      if (org.current_period_end && org.current_period_end < new Date())
+        return reply.code(402).send({ error: 'Subscription expired' })
+      if (plan && org.plan !== plan)
+        return reply.code(403).send({ error: 'Plan required' })
+      ;(req as any).org = org
+    }
+  }
+
+  const USAGE_LIMITS: Record<string, number> = { Basic: 3, Pro: 25 }
+
+  async function incrementUsage(orgId: string, key: string, plan: string) {
+    const limit = USAGE_LIMITS[plan]
+    if (!limit) return
+    const now = new Date()
+    const start = new Date(now.getFullYear(), now.getMonth(), 1)
+    const end = new Date(now.getFullYear(), now.getMonth() + 1, 1)
+    let counter = await prisma.usageCounter.findFirst({
+      where: { org_id: orgId, key, period_start: start, period_end: end },
+    })
+    if (!counter) {
+      await prisma.usageCounter.create({
+        data: { org_id: orgId, key, period_start: start, period_end: end, value: 1 },
+      })
+    } else {
+      if (counter.value >= limit) throw new Error('limit')
+      await prisma.usageCounter.update({
+        where: { id: counter.id },
+        data: { value: { increment: 1 } },
+      })
+    }
+  }
+
   // Tenant-aware routes
   app.get<{ Params: { orgId: string } }>(
     '/api/:orgId/credits',
@@ -316,10 +384,16 @@ async function buildServer() {
 
   // --------- RAG: Query credits via DeepSeek + Qdrant ---------
   type RagResponseItem = { credit_id: string; name: string; amount_estimated: number; explanation: string }
-  const qdrant = new QdrantClient({ url: QDRANT_URL, apiKey: QDRANT_API_KEY })
+  const qdrant =
+    process.env.TEST_MODE === 'true'
+      ? { search: async () => [] }
+      : new (await import('qdrant-client')).QdrantClient({ url: QDRANT_URL, apiKey: QDRANT_API_KEY })
   let embedder: any
   async function getEmbedder() {
-    if (!embedder) embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2')
+    if (!embedder) {
+      const { pipeline } = await import('@xenova/transformers')
+      embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2')
+    }
     return embedder
   }
   function l2Normalize(vec: number[]): number[] {
@@ -335,7 +409,7 @@ async function buildServer() {
 
   app.post<{ Body: { orgId?: string; profile: Record<string, any>; topK?: number } }>(
     '/api/rag/credits',
-    { preValidation: [app.authenticate] as any },
+    { preValidation: [app.authenticate, requireSubscription()] as any },
     async (req, reply) => {
       if (!DEEPSEEK_API_KEY) return reply.code(500).send({ error: 'DeepSeek not configured' })
       const schema = z.object({ orgId: z.string().optional(), profile: z.record(z.any()), topK: z.number().int().min(1).max(50).optional() })
@@ -343,6 +417,13 @@ async function buildServer() {
       const orgId = body.orgId || resolveOrgId(req)
       const userId = resolveUserId(req as any)
       if (orgId && !(await verifyOrgAccess(orgId, userId))) return reply.code(403).send({ error: 'Forbidden' })
+      const org = (req as any).org
+      try {
+        await incrementUsage(orgId as string, 'credits.detect', org.plan)
+      } catch {
+        return reply.code(402).send({ error: 'Usage limit exceeded' })
+      }
+      if (process.env.TEST_MODE === 'true') return []
 
       // 1) Embed query (company profile rendered to text)
       const profileText = JSON.stringify(body.profile)
@@ -407,20 +488,108 @@ async function buildServer() {
       return clean
     }
   )
+  // Billing ---------------------------------------------------
+  app.post(
+    '/api/billing/checkout',
+    { preValidation: [app.authenticate] as any },
+    async (req, reply) => {
+      const schema = z.object({
+        variantId: z.number().int(),
+        customerEmail: z.string().email().optional(),
+        successUrl: z.string(),
+        cancelUrl: z.string(),
+      })
+      const body = schema.parse(req.body as any)
+      const userId = resolveUserId(req as any) || ''
+      const orgId = resolveOrgId(req) || ''
+      const res = await createCheckout({
+        variantId: body.variantId,
+        customerEmail: body.customerEmail || '',
+        successUrl: body.successUrl,
+        cancelUrl: body.cancelUrl,
+        custom: { userId, orgId },
+      })
+      return res
+    }
+  )
+
+  app.post('/api/billing/webhook', async (req, reply) => {
+    const signature = (req.headers['x-signature'] as string) || ''
+    const raw = typeof req.body === 'string' ? req.body : JSON.stringify(req.body)
+    if (!verifyWebhookSignature(signature, raw))
+      return reply.code(400).send({ error: 'Invalid signature' })
+    const body: any = req.body
+    const eventId = body?.meta?.event_id || body?.id
+    const type = body?.meta?.event_name || body?.type
+    const exists = await prisma.webhookEvent.findUnique({ where: { id: eventId } })
+    if (exists) return { ok: true }
+    await prisma.webhookEvent.create({ data: { id: eventId, type: type || '', payload: body } })
+    const orgId = body?.data?.attributes?.custom_data?.orgId
+    if (orgId) {
+      switch (type) {
+        case 'subscription_created':
+          await prisma.organization.update({
+            where: { id: orgId },
+            data: {
+              status: body?.data?.attributes?.status || 'active',
+              plan: body?.data?.attributes?.variant_name || 'unknown',
+              lemon_customer_id: String(body?.data?.attributes?.customer_id || ''),
+              lemon_subscription_id: String(body?.data?.id || ''),
+              current_period_end: body?.data?.attributes?.renews_at
+                ? new Date(body.data.attributes.renews_at)
+                : null,
+            },
+          })
+          break
+        case 'payment_failed':
+          await prisma.organization.update({ where: { id: orgId }, data: { status: 'past_due' } })
+          break
+        case 'subscription_cancelled':
+          await prisma.organization.update({ where: { id: orgId }, data: { status: 'cancelled' } })
+          break
+      }
+    }
+    return { ok: true }
+  })
+
+  app.get(
+    '/api/billing/portal',
+    { preValidation: [app.authenticate] as any },
+    async (req, reply) => {
+      const orgId = resolveOrgId(req)
+      if (!orgId) return reply.code(400).send({ error: 'Missing org' })
+      const org = await prisma.organization.findUnique({ where: { id: orgId } })
+      if (!org?.lemon_customer_id) return reply.code(400).send({ error: 'No customer' })
+      const { url } = await createCustomerPortal({ customerId: org.lemon_customer_id })
+      return { url }
+    }
+  )
+
+  app.get('/api/billing/plans', async () => {
+    const variants = await getVariants()
+    return variants
+  })
 
   return app
 }
 
-buildServer()
-  .then((app) => app.listen({ port: PORT, host: '0.0.0.0' }))
-  .then((address) => {
-    console.log(`Gateway listening on ${address}`)
-  })
-  .catch(async (err) => {
-    console.error(err)
-    await prisma.$disconnect()
-    process.exit(1)
-  })
+import { fileURLToPath } from 'url'
+import { dirname } from 'path'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = dirname(__filename)
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  buildServer()
+    .then((app) => app.listen({ port: PORT, host: '0.0.0.0' }))
+    .then((address) => {
+      console.log(`Gateway listening on ${address}`)
+    })
+    .catch((err) => {
+      console.error(err)
+      process.exit(1)
+    })
+}
 
 declare module 'fastify' {
   interface FastifyInstance {

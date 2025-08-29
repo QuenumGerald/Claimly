@@ -1,3 +1,4 @@
+import React from 'react'
 import { clsx } from 'clsx'
 
 export function Button({ className, ...props }: React.ButtonHTMLAttributes<HTMLButtonElement>) {

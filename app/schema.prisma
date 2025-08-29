@@ -1,0 +1,111 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Organization {
+  id                   String   @id @default(uuid())
+  lemon_customer_id    String?  @unique
+  lemon_subscription_id String? @unique
+  plan                 String
+  status               String
+  current_period_end   DateTime?
+  entitlements         Entitlement[]
+  usageCounters        UsageCounter[]
+  members              OrganizationMember[]
+  credits              Credit[]
+  filings              Filing[]
+  files                File[]
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+}
+
+model User {
+  id                   String   @id @default(uuid())
+  email                String   @unique
+  organizations        OrganizationMember[]
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+}
+
+model OrganizationMember {
+  id             String      @id @default(uuid())
+  user           User        @relation(fields: [userId], references: [id])
+  userId         String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+  role           String      @default("member")
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  @@unique([userId, organizationId])
+}
+
+model WebhookEvent {
+  id         String   @id
+  type       String
+  payload    Json
+  created_at DateTime @default(now())
+}
+
+model Entitlement {
+  id     String      @id @default(uuid())
+  org    Organization @relation(fields: [org_id], references: [id])
+  org_id String
+  key    String
+  value  String
+}
+
+model UsageCounter {
+  id           String      @id @default(uuid())
+  org          Organization @relation(fields: [org_id], references: [id])
+  org_id       String
+  key          String
+  period_start DateTime
+  period_end   DateTime
+  value        Int      @default(0)
+}
+
+model Credit {
+  id             String      @id @default(uuid())
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+  amount         Int
+  reason         String?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+}
+
+model Filing {
+  id             String      @id @default(uuid())
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+  createdBy      User        @relation(fields: [createdById], references: [id])
+  createdById    String
+  reference      String
+  status         String      @default("draft")
+  metadata       Json?
+  file           File?       @relation(fields: [fileId], references: [id])
+  fileId         String?     @unique
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+}
+
+model File {
+  id             String      @id @default(uuid())
+  user           User        @relation(fields: [userId], references: [id])
+  userId         String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+  name           String
+  type           String
+  key            String      @unique
+  uploadUrl      String
+  filing         Filing?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+}
